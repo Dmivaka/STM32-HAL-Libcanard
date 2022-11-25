@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "libcanard/canard.h"
 #include "uavcan/node/Heartbeat_1_0.h"
+#include "uavcan/node/ExecuteCommand_1_1.h"
 #include "uavcan/_register/List_1_0.h"
 /* USER CODE END Includes */
 
@@ -54,6 +55,8 @@ size_t hbeat_ser_buf_size = uavcan_node_Heartbeat_1_0_SERIALIZATION_BUFFER_SIZE_
 uint8_t hbeat_ser_buf[uavcan_node_Heartbeat_1_0_SERIALIZATION_BUFFER_SIZE_BYTES_];
 
 CanardPortID const MSG_PORT_ID   = 1620U;
+
+uint8_t MCU_restart = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -151,15 +154,23 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  static uint8_t my_message_transfer_id = 0;
+  CanardRxSubscription command_subscription;
+  if( canardRxSubscribe(        &canard,
+                                CanardTransferKindRequest,
+                                uavcan_node_ExecuteCommand_1_1_FIXED_PORT_ID_,
+                                uavcan_node_ExecuteCommand_Request_1_1_EXTENT_BYTES_,
+                                CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC,
+                                &command_subscription) != 1 ){ Error_Handler(); }
   
-  CanardRxSubscription reg_list_subscription; // Transfer array_subscription state.
+  CanardRxSubscription reg_list_subscription;
   if( canardRxSubscribe(        &canard,
                                 CanardTransferKindRequest,
                                 uavcan_register_List_1_0_FIXED_PORT_ID_,
                                 uavcan_register_List_Request_1_0_EXTENT_BYTES_,
                                 CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC,
                                 &reg_list_subscription) != 1 ){ Error_Handler(); }
+  
+  static uint8_t my_message_transfer_id = 0;
   
   while (1)
   {
@@ -196,7 +207,14 @@ int main(void)
     while( HAL_GetTick() < timestamp + 1000u )
     {
       process_canard_TX_queue();
+      
       HAL_Delay(10);
+    }
+    
+    // unreliable impelementation 
+    if( MCU_restart )
+    {
+      NVIC_SystemReset();
     }
 
     // Increment the transfer_id variable
@@ -418,9 +436,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
   uint8_t RxData[64];
   
   if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK){ Error_Handler(); }
-  
-  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
-  
+
   CanardFrame rxf;
 
   rxf.extended_can_id = (uint32_t)RxHeader.Identifier;
@@ -459,64 +475,24 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
   return ;
 }
 
+void execute_command_callback(CanardRxTransfer *transfer);
+void register_list_callback(CanardRxTransfer *transfer);
+
 void processReceivedTransfer(int32_t redundant_interface_index, CanardRxTransfer *transfer)
 {
   if( transfer->metadata.port_id == MSG_PORT_ID)
   {
     // not implemented yet
   }
+  else if( transfer->metadata.port_id == uavcan_node_ExecuteCommand_1_1_FIXED_PORT_ID_)
+  {
+    // Got command request!
+    execute_command_callback(transfer);
+  }
   else if( transfer->metadata.port_id == uavcan_register_List_1_0_FIXED_PORT_ID_)
   {
     // Got register list request! 
-
-    uavcan_register_List_Request_1_0 request;
-    size_t request_ser_buf_size = uavcan_register_List_Request_1_0_EXTENT_BYTES_;
-
-    if( uavcan_register_List_Request_1_0_deserialize_(&request, transfer->payload, &request_ser_buf_size ) < 0)
-    {
-      Error_Handler();
-    }
-
-    uavcan_register_List_Response_1_0 my_response = {0};
-
-    char my_register_name[] = "register_ ";
-    my_register_name[9] = 'a'+request.index;
-
-    memcpy(&my_response.name.name.elements, my_register_name, sizeof(my_register_name));
-    my_response.name.name.count = sizeof(my_register_name);
-
-    if( request.index > 5 )
-    {
-      my_response.name.name.elements[0] = '\0';
-      my_response.name.name.count = 0;
-    }
-
-    uint8_t c_serialized[uavcan_register_List_Response_1_0_SERIALIZATION_BUFFER_SIZE_BYTES_] = {0};
-    size_t c_serialized_size = sizeof(c_serialized);
-
-    if ( uavcan_register_List_Response_1_0_serialize_(&my_response, &c_serialized[0], &c_serialized_size) < 0)
-    {
-      Error_Handler();
-    }
-
-    static int transfer_id = 0;
-
-    const CanardTransferMetadata transfer_metadata = {
-                                                    .priority       = CanardPriorityNominal,
-                                                    .transfer_kind  = CanardTransferKindResponse,
-                                                    .port_id        = uavcan_register_List_1_0_FIXED_PORT_ID_,
-                                                    .remote_node_id = transfer->metadata.remote_node_id,
-                                                    .transfer_id    = (CanardTransferID) transfer_id
-                                                    };
-
-    transfer_id++;
-
-    int32_t debug =  canardTxPush(	&queue,               	// Call this once per redundant CAN interface (queue)
-                                            &canard,
-                                            0,     					// Zero if transmission deadline is not limited.
-                                            &transfer_metadata,
-                                            c_serialized_size,		// Size of the message payload (see Nunavut transpiler)
-                                            c_serialized);
+    register_list_callback(transfer);
   }
   else
   {
@@ -524,6 +500,96 @@ void processReceivedTransfer(int32_t redundant_interface_index, CanardRxTransfer
   }
   
   return ;
+}
+
+void execute_command_callback(CanardRxTransfer *transfer)
+{
+  uavcan_node_ExecuteCommand_Request_1_1 request;
+  uavcan_node_ExecuteCommand_Response_1_1 response = {0};
+  
+  size_t request_ser_buf_size = uavcan_node_ExecuteCommand_Request_1_1_EXTENT_BYTES_;
+
+  if( uavcan_node_ExecuteCommand_Request_1_1_deserialize_(&request, transfer->payload, &request_ser_buf_size ) < 0)
+  {
+    Error_Handler();
+  }
+  
+  if( request.command == uavcan_node_ExecuteCommand_Request_1_1_COMMAND_RESTART )
+  {
+    MCU_restart = 1;
+    response.status = uavcan_node_ExecuteCommand_Response_1_1_STATUS_SUCCESS;
+  }
+  else
+  {
+    response.status = uavcan_node_ExecuteCommand_Response_1_1_STATUS_BAD_COMMAND;
+  }
+
+  uint8_t c_serialized[uavcan_node_ExecuteCommand_Response_1_1_SERIALIZATION_BUFFER_SIZE_BYTES_] = {0};
+  size_t c_serialized_size = sizeof(c_serialized);
+
+  if ( uavcan_node_ExecuteCommand_Response_1_1_serialize_(&response, &c_serialized[0], &c_serialized_size) < 0)
+  {
+    Error_Handler();
+  }
+
+  const CanardTransferMetadata transfer_metadata = {    .priority       = CanardPriorityNominal,
+                                                        .transfer_kind  = CanardTransferKindResponse,
+                                                        .port_id        = transfer->metadata.port_id,
+                                                        .remote_node_id = transfer->metadata.remote_node_id,
+                                                        .transfer_id    = transfer->metadata.transfer_id };
+
+  int32_t debug =  canardTxPush(        &queue,               	// Call this once per redundant CAN interface (queue)
+                                        &canard,
+                                        0,     					// Zero if transmission deadline is not limited.
+                                        &transfer_metadata,
+                                        c_serialized_size,		// Size of the message payload (see Nunavut transpiler)
+                                        c_serialized);
+}
+
+void register_list_callback(CanardRxTransfer *transfer)
+{
+  uavcan_register_List_Request_1_0 request;
+  size_t request_ser_buf_size = uavcan_register_List_Request_1_0_EXTENT_BYTES_;
+
+  if( uavcan_register_List_Request_1_0_deserialize_(&request, transfer->payload, &request_ser_buf_size ) < 0)
+  {
+    Error_Handler();
+  }
+
+  uavcan_register_List_Response_1_0 response = {0};
+
+  char my_register_name[] = "register_ ";
+  my_register_name[9] = 'a'+request.index;
+
+  memcpy(&response.name.name.elements, my_register_name, sizeof(my_register_name));
+  response.name.name.count = sizeof(my_register_name);
+
+  if( request.index > 5 )
+  {
+    response.name.name.elements[0] = '\0';
+    response.name.name.count = 0;
+  }
+
+  uint8_t c_serialized[uavcan_register_List_Response_1_0_SERIALIZATION_BUFFER_SIZE_BYTES_] = {0};
+  size_t c_serialized_size = sizeof(c_serialized);
+
+  if ( uavcan_register_List_Response_1_0_serialize_(&response, &c_serialized[0], &c_serialized_size) < 0)
+  {
+    Error_Handler();
+  }
+
+  const CanardTransferMetadata transfer_metadata = {    .priority       = CanardPriorityNominal,
+                                                        .transfer_kind  = CanardTransferKindResponse,
+                                                        .port_id        = transfer->metadata.port_id,
+                                                        .remote_node_id = transfer->metadata.remote_node_id,
+                                                        .transfer_id    = transfer->metadata.transfer_id };
+  
+  int32_t debug =  canardTxPush(        &queue,               	// Call this once per redundant CAN interface (queue)
+                                        &canard,
+                                        0,     					// Zero if transmission deadline is not limited.
+                                        &transfer_metadata,
+                                        c_serialized_size,		// Size of the message payload (see Nunavut transpiler)
+                                        c_serialized);
 }
 
 // allocate dynamic memory of desired size in bytes
