@@ -24,5 +24,5 @@ yakut sub uavcan.node.Heartbeat.1.0
 ```
 To send Real64-array to the node use the following:
 ```bash
-yakut -i 'CAN(can.media.socketcan.SocketCANMedia("can0",8),59)' pub 1620.uavcan.primitive.array.Real64.1.0 'value: [1.1,2.2,3.3,4.4,5.5]'
+y pub 1620:uavcan.primitive.array.Real32.1.0 'value: [1.1,2.2,3.3,4.4,5.5]'
 ```

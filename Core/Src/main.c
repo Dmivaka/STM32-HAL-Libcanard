@@ -26,6 +26,7 @@
 #include "uavcan/node/ExecuteCommand_1_1.h"
 #include "uavcan/_register/List_1_0.h"
 #include "uavcan/_register/Access_1_0.h"
+#include "uavcan/primitive/array/Real32_1_0.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -178,6 +179,14 @@ int main(void)
                                 uavcan_register_Access_Request_1_0_EXTENT_BYTES_,
                                 CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC,
                                 &reg_access_subscription) != 1 ){ Error_Handler(); }
+  
+  CanardRxSubscription rx_message_subscription;
+  if( canardRxSubscribe(        &canard,
+                                CanardTransferKindMessage,
+                                MSG_PORT_ID,
+                                uavcan_primitive_array_Real32_1_0_EXTENT_BYTES_,
+                                CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC,
+                                &rx_message_subscription) != 1 ){ Error_Handler(); }	  
   
   static uint8_t my_message_transfer_id = 0;
   
@@ -478,12 +487,12 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     // Nothing to do.
     // The received frame is either invalid or it's a non-last frame of a multi-frame transfer.
     // Reception of an invalid frame is NOT reported as an error because it is not an error.
-  }  
+  }
   
-
   return ;
 }
 
+void rx_message_callback(CanardRxTransfer *transfer);
 void execute_command_callback(CanardRxTransfer *transfer);
 void register_list_callback(CanardRxTransfer *transfer);
 void register_access_callback(CanardRxTransfer *transfer);
@@ -492,7 +501,8 @@ void processReceivedTransfer(int32_t redundant_interface_index, CanardRxTransfer
 {
   if( transfer->metadata.port_id == MSG_PORT_ID)
   {
-    // not implemented yet
+    // process incoming real32 array
+    rx_message_callback(transfer);
   }
   else if( transfer->metadata.port_id == uavcan_node_ExecuteCommand_1_1_FIXED_PORT_ID_)
   {
@@ -515,6 +525,17 @@ void processReceivedTransfer(int32_t redundant_interface_index, CanardRxTransfer
   }
   
   return ;
+}
+
+void rx_message_callback(CanardRxTransfer *transfer)
+{
+  uavcan_primitive_array_Real32_1_0 array;
+  size_t array_ser_buf_size = uavcan_primitive_array_Real32_1_0_EXTENT_BYTES_;
+
+  if ( uavcan_primitive_array_Real32_1_0_deserialize_( &array, transfer->payload, &array_ser_buf_size) < 0 )
+  {
+    Error_Handler();
+  }
 }
 
 void execute_command_callback(CanardRxTransfer *transfer)
@@ -573,13 +594,20 @@ void register_list_callback(CanardRxTransfer *transfer)
 
   uavcan_register_List_Response_1_0 response = {0};
 
-  char my_register_name[] = "register_ ";
-  my_register_name[9] = 'a'+request.index;
+  char led1_register_name[] = "user.led1";
+  char led2_register_name[] = "user.led2";
 
-  memcpy(&response.name.name.elements, my_register_name, sizeof(my_register_name));
-  response.name.name.count = sizeof(my_register_name);
-
-  if( request.index > 5 )
+  if( request.index == 0 )
+  {
+    memcpy(&response.name.name.elements, led1_register_name, sizeof(led1_register_name));
+    response.name.name.count = sizeof(led1_register_name);
+  }
+  else if( request.index == 1 )
+  {
+    memcpy(&response.name.name.elements, led2_register_name, sizeof(led2_register_name));
+    response.name.name.count = sizeof(led2_register_name);
+  }
+  else
   {
     response.name.name.elements[0] = '\0';
     response.name.name.count = 0;
@@ -607,6 +635,8 @@ void register_list_callback(CanardRxTransfer *transfer)
                                         c_serialized);
 }
 
+void LED1_access_handler(uavcan_register_Value_1_0 * req_value, uavcan_register_Value_1_0 * res_value );
+void LED2_access_handler(uavcan_register_Value_1_0 * req_value, uavcan_register_Value_1_0 * res_value );
 
 void register_access_callback(CanardRxTransfer *transfer)
 {
@@ -623,33 +653,23 @@ void register_access_callback(CanardRxTransfer *transfer)
   GPIO_TypeDef * GPIO_port = NULL;
   uint16_t GPIO_pin = 0;
   
-  if( !strncmp( (char const *)"LED1", (char const *)request.name.name.elements, request.name.name.count) )
+  if( !strncmp( (char const *)"user.led1", (char const *)request.name.name.elements, request.name.name.count) )
   {
-    GPIO_port = LED1_GPIO_Port;
-    GPIO_pin = LED1_Pin;
+    LED1_access_handler(&request.value, &response.value);
   }
-  else if( !strncmp( (char const *)"LED2", (char const *)request.name.name.elements, request.name.name.count) )
+  else if( !strncmp( (char const *)"user.led2", (char const *)request.name.name.elements, request.name.name.count) )
   {
-    GPIO_port = LED2_GPIO_Port;
-    GPIO_pin = LED2_Pin;
+    LED2_access_handler(&request.value, &response.value);
   }
   else
   {
+    // access to non-existent register
+    response.value._tag_= 0;
+  }
 
-  }
-  
-  if( request.value.integer8.value.elements[0] == 1 )
-  {
-    HAL_GPIO_WritePin(GPIO_port, GPIO_pin, GPIO_PIN_SET);
-  }
-  else
-  {
-    HAL_GPIO_WritePin(GPIO_port, GPIO_pin, GPIO_PIN_RESET);
-  }
-  
-  response.value._tag_= 7;
-  response.value.integer8.value.count = 1;
-  response.value.integer8.value.elements[0] = HAL_GPIO_ReadPin(GPIO_port, GPIO_pin);
+  response.timestamp.microsecond = micros(); // taken along with register READING
+  response._mutable = 1;
+  response.persistent = 0;
   
   uint8_t c_serialized[uavcan_register_Access_Response_1_0_SERIALIZATION_BUFFER_SIZE_BYTES_] = {0};
   size_t c_serialized_size = sizeof(c_serialized);
@@ -671,6 +691,46 @@ void register_access_callback(CanardRxTransfer *transfer)
                                         &transfer_metadata,
                                         c_serialized_size,		// Size of the message payload (see Nunavut transpiler)
                                         c_serialized);  
+}
+
+void LED1_access_handler(uavcan_register_Value_1_0 * req_value, uavcan_register_Value_1_0 * res_value )
+{
+  if( req_value->_tag_ != 0 ) // is it write access ?
+  {
+    if( req_value->integer8.value.elements[0] == 1 )
+    {
+      HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+    }
+    else if( req_value->integer8.value.elements[0] == 0 )
+    {
+      HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+    }
+  }
+
+  // return register value
+  res_value->_tag_= 7;
+  res_value->integer8.value.count = 1;
+  res_value->integer8.value.elements[0] = HAL_GPIO_ReadPin(LED1_GPIO_Port, LED1_Pin);
+}
+
+void LED2_access_handler(uavcan_register_Value_1_0 * req_value, uavcan_register_Value_1_0 * res_value )
+{
+  if( req_value->_tag_ != 0 ) // is it write access ?
+  {
+    if( req_value->integer8.value.elements[0] == 1 )
+    {
+      HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+    }
+    else if( req_value->integer8.value.elements[0] == 0 )
+    {
+      HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+    }
+  }
+
+  // return register value
+  res_value->_tag_= 7;
+  res_value->integer8.value.count = 1;
+  res_value->integer8.value.elements[0] = HAL_GPIO_ReadPin(LED2_GPIO_Port, LED2_Pin);
 }
 
 // allocate dynamic memory of desired size in bytes
